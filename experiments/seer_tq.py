@@ -21,6 +21,7 @@ from explanations.concept import CAR, CAV
 from explanations.feature import CARFeatureImportance
 from utils.quantum_circuit_helpers import (
     SeerConceptModelWrapper,
+    _compute_pullback_coefficients_over_set,
     _select_top_observable_indices,
     generate_random_circuits,
 )
@@ -181,6 +182,7 @@ def concept_accuracy(
         model_name,
         random_seed,
         repr_mode=repr_mode,
+        pullback_target_mode="z_sum",
         concept_layer=concept_layer,
         model_dir=model_dir,
     )
@@ -188,20 +190,7 @@ def concept_accuracy(
     test_loss, test_acc = model.model.test_epoch(device, test_loader)
     logging.info(f"Circuit {circuit_idx}: test_loss={test_loss:.4f}, test_acc={test_acc:.4f}")
     
-    if repr_mode == "pullback":
-        x_concept_train = _collect_dataset_inputs(train_data, n_samples=pullback_selection_n)
-        selected_idx, _ = _select_top_observable_indices(
-            model,
-            x_concept_train.detach().cpu().numpy().astype(np.float32, copy=False),
-            repr_mode=repr_mode,
-            random_seed=int(random_seed),
-            top_n=int(pullback_top_n),
-            target_mode=model.pullback_target_mode,
-            aggregate="mean_abs",
-        )
-        model.set_pullback_observables(selected_idx)
-        logging.info(f"Selected {len(selected_idx)} pullback observables from full train set.")
-
+    concept_pullback_indices = [None for _ in range(5)]
     results_data = []
     car_classifiers = [CAR(device, batch_size, kernel="linear") for _ in range(5)]
     cav_classifiers = [CAV(device, batch_size) for _ in range(5)]
@@ -210,6 +199,24 @@ def concept_accuracy(
         X_train, C_train = generate_seer_concept_dataset(
             train_data, concept_id, 250, random_seed
         )
+        if repr_mode == "pullback":
+            pos_mask = (C_train == 1)
+            x_concept_pos = X_train[pos_mask]
+            selected_idx, _ = _select_top_observable_indices(
+                model,
+                x_concept_pos.detach().cpu().numpy().astype(np.float32, copy=False),
+                repr_mode=repr_mode,
+                random_seed=int(random_seed),
+                top_n=int(pullback_top_n),
+                target_mode=model.pullback_target_mode,
+                aggregate="mean_abs",
+            )
+            model.set_pullback_observables(selected_idx)
+            concept_pullback_indices[concept_id] = np.asarray(selected_idx, dtype=np.int64)
+            logging.info(
+                f"Grade {concept_id+1}: selected {len(selected_idx)} pullback observables from "
+                f"{int(pos_mask.sum().item())} positive samples."
+            )
         X_train = X_train.to(device)
         H_train = model.input_to_representation(X_train).detach().cpu().numpy()
         car = car_classifiers[concept_id]
@@ -221,6 +228,8 @@ def concept_accuracy(
             test_data, concept_id, 50, random_seed
         )
         X_test = X_test.to(device)
+        if repr_mode == "pullback":
+            model.set_pullback_observables(concept_pullback_indices[concept_id])
         H_test = model.input_to_representation(X_test).detach().cpu().numpy()
         results_data.append(
             [
@@ -295,6 +304,7 @@ def global_explanations(
         model_name,
         random_seed,
         repr_mode=repr_mode,
+        pullback_target_mode="z_sum",
         concept_layer=concept_layer,
         model_dir=model_dir,
     )
@@ -302,26 +312,31 @@ def global_explanations(
     test_loss, test_acc = model.model.test_epoch(device, test_loader)
     logging.info(f"Circuit {circuit_idx}: test_loss={test_loss:.4f}, test_acc={test_acc:.4f}")
 
-    if repr_mode == "pullback":
-        x_concept_train = _collect_dataset_inputs(train_data, n_samples=pullback_selection_n)
-        selected_idx, _ = _select_top_observable_indices(
-            model,
-            x_concept_train.detach().cpu().numpy().astype(np.float32, copy=False),
-            repr_mode=repr_mode,
-            random_seed=int(random_seed),
-            top_n=int(pullback_top_n),
-            target_mode=model.pullback_target_mode,
-            aggregate="mean_abs",
-        )
-        model.set_pullback_observables(selected_idx)
-        logging.info(f"Selected {len(selected_idx)} pullback observables from full train set.")
-
     car_classifiers = [CAR(device, batch_size) for _ in range(5)]
+    concept_pullback_indices = [None for _ in range(5)]
     for concept_id in range(5):
         logging.info(f"Now fitting a CAR classifier for Grade {concept_id+1} patients")
         X_train, C_train = generate_seer_concept_dataset(
             train_data, concept_id, 250, random_seed
         )
+        if repr_mode == "pullback":
+            pos_mask = (C_train == 1)
+            x_concept_pos = X_train[pos_mask]
+            selected_idx, _ = _select_top_observable_indices(
+                model,
+                x_concept_pos.detach().cpu().numpy().astype(np.float32, copy=False),
+                repr_mode=repr_mode,
+                random_seed=int(random_seed),
+                top_n=int(pullback_top_n),
+                target_mode=model.pullback_target_mode,
+                aggregate="mean_abs",
+            )
+            model.set_pullback_observables(selected_idx)
+            concept_pullback_indices[concept_id] = np.asarray(selected_idx, dtype=np.int64)
+            logging.info(
+                f"Grade {concept_id+1}: selected {len(selected_idx)} pullback observables from "
+                f"{int(pos_mask.sum().item())} positive samples."
+            )
         X_train = X_train.to(device)
         H_train = model.input_to_representation(X_train).detach().cpu().numpy()
         car = car_classifiers[concept_id]
@@ -331,8 +346,15 @@ def global_explanations(
     results_data = []
     for X_test, Y_test in tqdm(test_loader, unit="batch", leave=False):
         X_test = X_test.to(device)
-        H_test = model.input_to_representation(X_test).detach().cpu().numpy()
-        pred_concepts = [car.predict(H_test) for car in car_classifiers]
+        if repr_mode == "pullback":
+            pred_concepts = []
+            for concept_id, car in enumerate(car_classifiers):
+                model.set_pullback_observables(concept_pullback_indices[concept_id])
+                h_test_concept = model.input_to_representation(X_test).detach().cpu().numpy()
+                pred_concepts.append(car.predict(h_test_concept))
+        else:
+            H_test = model.input_to_representation(X_test).detach().cpu().numpy()
+            pred_concepts = [car.predict(H_test) for car in car_classifiers]
         results_data += [
             ["TCAR", label.item()]
             + [pred_concept[example_id] for pred_concept in pred_concepts]
@@ -344,34 +366,42 @@ def global_explanations(
     logging.info(f"Saving results in {save_dir}")
     results_df.to_csv(save_dir / "metrics.csv", index=False)
     if plot:
-        plot_seer_global_explanation(save_dir)
+        plot_seer_global_explanation(
+            save_dir,
+            filename=f"seer_global_{repr_mode}_layer_{concept_layer}.pdf",
+        )
 
     grade_cols = [f"Grade {i+1}" for i in range(5)]
-    class_means = results_df.groupby("Class")[grade_cols].mean()
-    dies = class_means.loc[0] if 0 in class_means.index else pd.Series(0.0, index=grade_cols)
-    survives = class_means.loc[1] if 1 in class_means.index else pd.Series(0.0, index=grade_cols)
-    delta = dies - survives
+    dies = {}
+    survives = {}
+    for grade in grade_cols:
+        grade_active = results_df[grade] > 0.5
+        if grade_active.any():
+            dies[grade] = float((results_df.loc[grade_active, "Class"] == 0).mean())
+            survives[grade] = float((results_df.loc[grade_active, "Class"] == 1).mean())
+        else:
+            dies[grade] = 0.0
+            survives[grade] = 0.0
+    delta = {grade: dies[grade] - survives[grade] for grade in grade_cols}
     return {
-        "dies": dies.to_dict(),
-        "survives": survives.to_dict(),
-        "delta": delta.to_dict(),
+        "dies": dies,
+        "survives": survives,
+        "delta": delta,
     }
 
 
-def feature_importance(
+def quantum_concept_importance(
     random_seed: int,
     batch_size: int,
     latent_dim: int,
-    plot: bool,
     model_name: str,
     repr_mode: str = "pullback",
     pullback_top_n: int = 20,
-    pullback_selection_n: int = 1024,
     concept_layer: int = -1,
     test_fraction: float = 0.1,
     model_dir: Path = Path.cwd() / "results/seer_tq",
     data_dir: Path = Path.cwd() / "data/seer",
-    save_dir: Path = Path.cwd() / "results/seer_tq/feature_importance",
+    save_dir: Path = Path.cwd() / "results/seer_tq/quantum_concept_importance",
 ):
     torch.manual_seed(random_seed)
     device = torch.device("cpu")
@@ -379,7 +409,6 @@ def feature_importance(
     if not save_dir.exists():
         os.makedirs(save_dir)
 
-    # Load data
     train_data = SEERDataset(
         str(data_dir / "seer.csv"),
         random_seed,
@@ -396,69 +425,109 @@ def feature_importance(
     )
     test_loader = DataLoader(test_data, batch_size)
 
-    # Load model
+    # Concept-side model uses z_sum selection to construct O_C.
+    # Keep pullback feature path active even when repr_mode='random' so we can
+    # explicitly set one shared random observable subset for all concepts.
     model = _load_seer_concept_model(
         model_name,
         random_seed,
-        repr_mode=repr_mode,
+        repr_mode="pullback",
+        pullback_target_mode="z_sum",
         concept_layer=concept_layer,
         model_dir=model_dir,
     )
-    if repr_mode == "pullback":
-        x_full_train = _collect_dataset_inputs(train_data, n_samples=pullback_selection_n)
-        selected_idx, _ = _select_top_observable_indices(
+
+    test_loss, test_acc = model.model.test_epoch(device, test_loader)
+    logging.info(f"Circuit {circuit_idx}: test_loss={test_loss:.4f}, test_acc={test_acc:.4f}")
+
+    shared_random_idx = None
+    if repr_mode == "random":
+        x_seed = _collect_dataset_inputs(train_data, n_samples=1)
+        shared_random_idx, shared_random_names = _select_top_observable_indices(
             model,
-            x_full_train.detach().cpu().numpy().astype(np.float32, copy=False),
-            repr_mode=repr_mode,
+            x_seed.detach().cpu().numpy().astype(np.float32, copy=False),
+            repr_mode="random",
             random_seed=int(random_seed),
             top_n=int(pullback_top_n),
-            target_mode=model.pullback_target_mode,
+            target_mode="z_sum",
             aggregate="mean_abs",
         )
-        model.set_pullback_observables(selected_idx)
-        logging.info(f"Selected {len(selected_idx)} pullback observables from full train set.")
+        shared_random_idx = np.asarray(shared_random_idx, dtype=np.int64)
+        logging.info(
+            "Shared random observables for all concepts: "
+            f"{shared_random_names}"
+        )
 
-    results_data = []
-    baselines = torch.zeros((1, 25)).to(device)
+    concept_pullback_indices = []
+    concept_observable_coeffs = []
     for concept_id in range(5):
-        logging.info(f"Now fitting a CAR classifier for Grade {concept_id+1} patients")
+        logging.info(f"Building O_C for Grade {concept_id+1} using linear SVM")
         X_train, C_train = generate_seer_concept_dataset(
             train_data, concept_id, 250, random_seed
         )
-        X_train = X_train.to(device)
-        H_train = model.input_to_representation(X_train).detach().cpu().numpy()
+
+        if repr_mode == "pullback":
+            pos_mask = C_train == 1
+            x_concept_pos = X_train[pos_mask]
+            selected_idx, _ = _select_top_observable_indices(
+                model,
+                x_concept_pos.detach().cpu().numpy().astype(np.float32, copy=False),
+                repr_mode="pullback",
+                random_seed=int(random_seed),
+                top_n=int(pullback_top_n),
+                target_mode="z_sum",
+                aggregate="mean_abs",
+            )
+            selected_idx = np.asarray(selected_idx, dtype=np.int64)
+        elif repr_mode == "random":
+            selected_idx = shared_random_idx
+        else:
+            raise ValueError(
+                "quantum_concept_importance expects repr_mode in {'pullback', 'random'}."
+            )
+
+        model.set_pullback_observables(selected_idx)
+        concept_pullback_indices.append(selected_idx)
+
+        H_train = model.input_to_representation(X_train.to(device)).detach().cpu().numpy()
         car = CAR(device, batch_size, kernel="linear")
         car.fit(H_train, C_train.numpy())
-        logging.info(
-            f"Computing feature importance over the test set for Grade {concept_id+1} patients"
-        )
-        attribution_method = CARFeatureImportance(
-            "Integrated Gradient", car, model, device
-        )
-        attributions = attribution_method.attribute(test_loader, baselines=baselines)
-        for attribution in attributions:
-            reduced_attribution = (
-                np.abs(attribution[:4]).tolist()
-                + [np.sum(np.abs(attribution[4:14]))]
-                + [np.sum(np.abs(attribution[14:]))]
-            )
-            results_data.append(reduced_attribution)
+        coeff = np.asarray(car.classifier.coef_, dtype=np.float32).reshape(-1)
+        concept_observable_coeffs.append(coeff)
 
-    results_df = pd.DataFrame(
-        results_data,
-        columns=[
-            "Age",
-            "PSA",
-            "Positive Cores",
-            "Examined Cores",
-            "Clinical Stage",
-            "Gleason Scores",
-        ],
-    )
-    logging.info(f"Saving results in {save_dir}")
+    # Decision-side O_eff uses head-absorbed pullback (patched as die-survive margin).
+    concept_scores = {concept_id: [] for concept_id in range(5)}
+    for X_test, _Y_test in tqdm(test_loader, unit="batch", leave=False):
+        x_np = X_test.detach().cpu().numpy().astype(np.float32, copy=False)
+        eff_coeff_full, _ = _compute_pullback_coefficients_over_set(
+            model,
+            x_np,
+            target_mode="head_absorbed",
+        )
+
+        for concept_id in range(5):
+            idx = concept_pullback_indices[concept_id]
+            o_eff = eff_coeff_full[:, idx]
+            o_c = concept_observable_coeffs[concept_id]
+
+            denom = np.linalg.norm(o_eff, axis=1) * max(np.linalg.norm(o_c), 1e-12)
+            denom = np.maximum(denom, 1e-12)
+            alpha = np.einsum("bi,i->b", o_eff, o_c) / denom
+            concept_scores[concept_id].append(alpha.astype(np.float32, copy=False))
+
+    results_data = []
+    summary = {}
+    for concept_id in range(5):
+        all_alpha = np.concatenate(concept_scores[concept_id], axis=0)
+        score = float(np.mean(all_alpha)) if all_alpha.size > 0 else float("nan")
+        concept_name = f"Grade {concept_id+1}"
+        summary[concept_name] = score
+        results_data.append([concept_name, score])
+
+    results_df = pd.DataFrame(results_data, columns=["Concept", "HS Alignment"])
+    logging.info(f"Saving quantum concept importance results in {save_dir}")
     results_df.to_csv(save_dir / "metrics.csv", index=False)
-    if plot:
-        plot_seer_feature_importance(save_dir)
+    return summary
 
 
 if __name__ == "__main__":
@@ -483,8 +552,9 @@ if __name__ == "__main__":
     parser.add_argument("--concept_layer", type=int, default=-1)
     parser.add_argument("--n_circuits", type=int, default=10)
     args = parser.parse_args()
-    args.concept_layer = 0
+    args.concept_layer = 1
     args.repr = "random"
+    args.pullback_top_n = 8
 
     # Explicit task-style configuration, aligned with mnist_tq_poison pattern.
     SEER_TASK = {
@@ -508,8 +578,10 @@ if __name__ == "__main__":
     model_root = Path.cwd() / "results" / "seer_tq"
     all_concept_rows = []
     all_delta_rows = []
+    all_pair_rows = []
+    all_qci_rows = []
    
-    random.seed(12) #52
+    random.seed(12) #22
     circuits = generate_random_circuits(n_qubits, n_layers, n_circuits)
 
     # for circuit_idx, (single, enta) in enumerate(circuits, start=1):        
@@ -535,76 +607,81 @@ if __name__ == "__main__":
             design = single_enta_to_design(single, enta, arch_code)
     
             model_name = f"model_{args.latent_dim}_circuit_{circuit_idx}"
-            save_dir = model_root / f"seer_global_{circuit_idx}"
+            save_dir = model_root / "global_explanations" / f"seer_global_{circuit_idx}"
             concept_save_dir = model_root / "concept_accuracy" / f"circuit_{circuit_idx}"
+            qci_save_dir = model_root / "quantum_concept_importance" / f"circuit_{circuit_idx}"
 
             logging.info(
                 f"Running SEER experiment {circuit_idx}/{n_circuits} with model {model_name}"
             )        
 
-            global_stats = global_explanations(
+            # qci_stats = quantum_concept_importance(
+            #     args.seeds[0],
+            #     args.batch_size,
+            #     args.latent_dim,
+            #     model_name=model_name,
+            #     repr_mode=args.repr,
+            #     pullback_top_n=args.pullback_top_n,
+            #     concept_layer=args.concept_layer,
+            #     save_dir=qci_save_dir,
+            #     model_dir=model_root,
+            # )
+
+            # qci_row = {
+            #     "circuit_id": circuit_idx,
+            # }
+            # for grade in range(1, 6):
+            #     qci_row[f"grade {grade}"] = float(qci_stats[f"Grade {grade}"])
+            # all_qci_rows.append(qci_row)
+
+            # global_stats = global_explanations(
+            #     args.seeds[0],
+            #     args.batch_size,
+            #     args.latent_dim,
+            #     args.plot,
+            #     model_name=model_name,
+            #     repr_mode=args.repr,
+            #     pullback_top_n=args.pullback_top_n,
+            #     pullback_selection_n=args.pullback_selection_n,
+            #     concept_layer=args.concept_layer,
+            #     save_dir=save_dir,
+            #     model_dir=model_root,
+            # )            
+
+            # pair_row = {
+            #     "circuit_id": circuit_idx,
+            # }
+            # for grade in range(1, 6):
+            #     die_score = float(global_stats["dies"][f"Grade {grade}"])
+            #     survive_score = float(global_stats["survives"][f"Grade {grade}"])
+            #     pair_row[f"grade {grade}"] = f"[{die_score:.2f}, {survive_score:.2f}]"
+            # all_pair_rows.append(pair_row)
+
+            concept_stats = concept_accuracy(
                 args.seeds[0],
                 args.batch_size,
                 args.latent_dim,
-                args.plot,
                 model_name=model_name,
                 repr_mode=args.repr,
                 pullback_top_n=args.pullback_top_n,
                 pullback_selection_n=args.pullback_selection_n,
                 concept_layer=args.concept_layer,
-                save_dir=save_dir,
                 model_dir=model_root,
+                save_dir=concept_save_dir,
             )
 
-            for method in ["delta"]:
+            for method in ["CAR", "CAV"]:
                 row = {
                     "circuit_id": circuit_idx,
                     "method": method,
                 }
                 for grade in range(1, 6):
-                    row[f"grade {grade}"] = float(global_stats[method][f"Grade {grade}"])
-                all_delta_rows.append(row)
+                    row[f"grade {grade}"] = float(concept_stats[method][f"grade {grade}"])
+                all_concept_rows.append(row)
 
-    #         concept_stats = concept_accuracy(
-    #             args.seeds[0],
-    #             args.batch_size,
-    #             args.latent_dim,
-    #             model_name=model_name,
-    #             repr_mode=args.repr,
-    #             pullback_top_n=args.pullback_top_n,
-    #             pullback_selection_n=args.pullback_selection_n,
-    #             concept_layer=args.concept_layer,
-    #             model_dir=model_root,
-    #             save_dir=concept_save_dir,
-    #         )
-
-    #         for method in ["CAR", "CAV"]:
-    #             row = {
-    #                 "circuit_id": circuit_idx,
-    #                 "method": method,
-    #             }
-    #             for grade in range(1, 6):
-    #                 row[f"grade {grade}"] = float(concept_stats[method][f"grade {grade}"])
-    #             all_concept_rows.append(row)
-
-    # if all_concept_rows:
-    #     concept_df = pd.DataFrame(
-    #         all_concept_rows,
-    #         columns=[
-    #             "circuit_id",
-    #             "method",
-    #             "grade 1",
-    #             "grade 2",
-    #             "grade 3",
-    #             "grade 4",
-    #             "grade 5",
-    #         ],
-    #     )
-    #     concept_df.to_csv(model_root / "concept_accuracy_all_circuits.csv", index=False)
-
-    if all_delta_rows:
-        delta_df = pd.DataFrame(
-            all_delta_rows,
+    if all_concept_rows:
+        concept_df = pd.DataFrame(
+            all_concept_rows,
             columns=[
                 "circuit_id",
                 "method",
@@ -615,15 +692,40 @@ if __name__ == "__main__":
                 "grade 5",
             ],
         )
-        delta_df.to_csv(model_root / "delta_all_circuits.csv", index=False)
+        concept_df.to_csv(model_root / "concept_accuracy_all_circuits.csv", index=False)
 
-    # feature_importance(
-    #     args.seeds[0],
-    #     args.batch_size,
-    #     args.latent_dim,
-    #     args.plot,
-    #     model_name=model_name,
-    #     repr_mode=args.repr,
-    #     pullback_top_n=args.pullback_top_n,
-    #     pullback_selection_n=args.pullback_selection_n,
-    # )
+    if all_pair_rows:
+        pair_df = pd.DataFrame(
+            all_pair_rows,
+            columns=[
+                "circuit_id",
+                "grade 1",
+                "grade 2",
+                "grade 3",
+                "grade 4",
+                "grade 5",
+            ],
+        )
+        pair_df.to_csv(
+            model_root
+            / f"all_circuits_{args.repr}_layer_{args.concept_layer}.csv",
+            index=False,
+        )
+
+    if all_qci_rows:
+        qci_df = pd.DataFrame(
+            all_qci_rows,
+            columns=[
+                "circuit_id",
+                "grade 1",
+                "grade 2",
+                "grade 3",
+                "grade 4",
+                "grade 5",
+            ],
+        )
+        qci_df.to_csv(
+            model_root
+            / f"qci_all_circuits_{args.repr}_layer_{args.concept_layer}.csv",
+            index=False,
+        )   

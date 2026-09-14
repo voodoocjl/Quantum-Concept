@@ -605,6 +605,34 @@ def _resolve_head_weight_matrix(model) -> np.ndarray:
     return weight
 
 
+def _resolve_head_margin_coefficients(head_weight: np.ndarray) -> np.ndarray:
+    """Build fixed signed class-margin coefficients for head-absorbed pullback.
+
+    For binary heads this returns W[0] - W[1] (die-survive direction).
+    For multi-class heads this returns one-vs-rest margin for class 0.
+    """
+    if head_weight.ndim != 2:
+        raise ValueError(f"Expected 2D head weights, got shape {head_weight.shape}.")
+
+    n_classes = int(head_weight.shape[0])
+    if n_classes < 2:
+        raise ValueError(
+            "Head-absorbed margin requires at least 2 output classes "
+            f"(got {n_classes})."
+        )
+
+    if n_classes == 2:
+        coeff = head_weight[0] - head_weight[1]
+    else:
+        others = np.mean(head_weight[1:], axis=0)
+        coeff = head_weight[0] - others
+
+    coeff = np.asarray(coeff, dtype=np.float32)
+    if np.allclose(coeff, 0.0):
+        coeff = np.ones_like(coeff, dtype=np.float32)
+    return coeff
+
+
 def build_target_observable(
     n_qubits: int,
     mode: str = "z_sum",
@@ -655,10 +683,8 @@ def build_target_observable(
                 f"Linear-head input dim ({head_weight.shape[1]}) does not match n_qubits ({n_qubits})."
             )
 
-        # Per-qubit contribution to the full logit vector: ||W[:, i]||_2.
-        coeff = np.linalg.norm(head_weight, axis=0).astype(np.float32, copy=False)
-        if np.allclose(coeff, 0.0):
-            coeff = np.ones_like(coeff, dtype=np.float32)
+        # Fixed decision direction in head space: die-survive margin for binary heads.
+        coeff = _resolve_head_margin_coefficients(head_weight)
 
         target = np.zeros_like(observables[0], dtype=np.complex64)
         for idx in range(n_qubits):

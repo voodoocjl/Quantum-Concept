@@ -85,25 +85,34 @@ def plot_global_explanation(results_dir: Path, dataset_name: str, concept_catego
             plt.close()
 
 
-def plot_seer_global_explanation(results_dir: Path) -> None:
+def plot_seer_global_explanation(results_dir: Path, filename: str = "seer_global.pdf") -> None:
     sns.set(font_scale=1.2)
     sns.color_palette("colorblind")
     sns.set_style("white")
     metrics_df = pd.read_csv(results_dir / "metrics.csv")
     concepts = list(metrics_df.columns[2:])
     methods = metrics_df["Method"].unique()
-    classes_dic = {1: "Survives", 0: "Dies"}
+    classes_dic = {0: "Dies", 1: "Survives"}
     plot_data = []
-    for class_idx, concept, method in itertools.product(classes_dic, concepts, methods):
-        attr = np.array(metrics_df.loc[(metrics_df.Class == class_idx) & (metrics_df.Method == method)][concept])
-        score = np.sum(attr)/len(attr)
-        plot_data.append([method, classes_dic[class_idx], concept, score])
+    for concept, method in itertools.product(concepts, methods):
+        method_df = metrics_df.loc[metrics_df.Method == method]
+        concept_present = method_df[concept] > 0.5
+        conditioned_df = method_df.loc[concept_present]
+        denom = len(conditioned_df)
+        if denom == 0:
+            logging.warning(
+                f"No samples with {concept}=1 for method {method}; skipping conditional probability."
+            )
+            continue
+        for class_idx, class_name in classes_dic.items():
+            score = float((conditioned_df["Class"] == class_idx).mean())
+            plot_data.append([method, class_name, concept, score])
     plot_df = pd.DataFrame(plot_data, columns=["Method", "Patient outcome", "Concept", "Score"])
     sns.barplot(data=plot_df, x="Concept", y="Score", hue="Patient outcome")
     plt.ylim(bottom=0, top=1.1)
-    plt.ylabel("TCAR Score")
+    plt.ylabel("P(Outcome | Grade=1)")
     plt.tight_layout()
-    plt.savefig(results_dir / "seer_global.pdf")
+    plt.savefig(results_dir / filename)
     plt.close()
 
 
